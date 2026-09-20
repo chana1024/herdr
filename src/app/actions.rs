@@ -239,13 +239,16 @@ impl AppState {
             return false;
         }
 
-        self.switch_workspace_tab(ws_idx, tab_idx);
+        self.switch_workspace_tab_preserving_seen(ws_idx, tab_idx);
         if let Some(tab) = self
             .workspaces
             .get_mut(ws_idx)
             .and_then(|ws| ws.tabs.get_mut(tab_idx))
         {
             tab.layout.focus_pane(pane_id);
+            if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                pane.seen = true;
+            }
             self.previous_pane_focus = previous;
             self.mark_session_dirty();
             return true;
@@ -399,11 +402,22 @@ impl AppState {
                     public_tab_id_for_index(ws, active_tab).unwrap_or_else(|| workspace_id.clone());
                 crate::logging::tab_focused(&workspace_id, &tab_id);
             }
+            self.mark_active_tab_seen();
             self.record_pane_focus_after_navigation(previous_focus);
         }
     }
 
     pub(crate) fn switch_workspace_tab(&mut self, ws_idx: usize, tab_idx: usize) -> bool {
+        if !self.switch_workspace_tab_preserving_seen(ws_idx, tab_idx) {
+            return false;
+        }
+        self.mark_active_tab_seen();
+        true
+    }
+
+    /// Switches the active workspace and tab without touching pane `seen`
+    /// flags, for navigation where focus lands on one specific pane.
+    fn switch_workspace_tab_preserving_seen(&mut self, ws_idx: usize, tab_idx: usize) -> bool {
         if ws_idx >= self.workspaces.len() {
             return false;
         }
@@ -470,6 +484,22 @@ impl AppState {
             }
         }
         changed
+    }
+
+    /// Marks one pane as seen without touching sibling panes in its tab.
+    pub(crate) fn mark_pane_seen(&mut self, ws_idx: usize, pane_id: PaneId) -> bool {
+        let Some(pane) = self
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|ws| ws.pane_state_mut(pane_id))
+        else {
+            return false;
+        };
+        if pane.seen {
+            return false;
+        }
+        pane.seen = true;
+        true
     }
 
     pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) -> bool {
@@ -2778,6 +2808,43 @@ mod tests {
         let mut state = app_with_workspaces(&["a"]);
         state.switch_workspace(5);
         assert_eq!(state.active, Some(0));
+    }
+
+    #[test]
+    fn focus_pane_from_other_tab_marks_only_focused_pane_seen() {
+        let mut state = app_with_workspaces(&["work"]);
+        let first = state.workspaces[0].tabs[0].root_pane;
+        let second = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let other_tab = state.workspaces[0].test_add_tab(Some("other"));
+        state.workspaces[0].pane_state_mut(first).unwrap().seen = false;
+        state.workspaces[0].pane_state_mut(second).unwrap().seen = false;
+        state.active = Some(0);
+        state.workspaces[0].switch_tab(other_tab);
+
+        assert!(state.focus_pane_in_workspace(0, first));
+
+        let ws = &state.workspaces[0];
+        assert_eq!(ws.active_tab, 0);
+        assert!(ws.pane_state(first).unwrap().seen);
+        assert!(!ws.pane_state(second).unwrap().seen);
+    }
+
+    #[test]
+    fn switch_workspace_tab_marks_all_panes_in_tab_seen() {
+        let mut state = app_with_workspaces(&["work"]);
+        let first = state.workspaces[0].tabs[0].root_pane;
+        let second = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let other_tab = state.workspaces[0].test_add_tab(Some("other"));
+        state.workspaces[0].pane_state_mut(first).unwrap().seen = false;
+        state.workspaces[0].pane_state_mut(second).unwrap().seen = false;
+        state.active = Some(0);
+        state.workspaces[0].switch_tab(other_tab);
+
+        assert!(state.switch_workspace_tab(0, 0));
+
+        let ws = &state.workspaces[0];
+        assert!(ws.pane_state(first).unwrap().seen);
+        assert!(ws.pane_state(second).unwrap().seen);
     }
 
     #[test]

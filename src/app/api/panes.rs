@@ -497,7 +497,7 @@ impl App {
         };
 
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
-        self.state.mark_active_tab_seen();
+        self.state.mark_pane_seen(ws_idx, pane_id);
         self.state.mode = crate::app::Mode::Terminal;
 
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
@@ -4340,6 +4340,50 @@ mod tests {
             panic!("expected pane info response");
         };
         assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Idle);
+    }
+
+    #[test]
+    fn api_pane_focus_from_other_tab_keeps_sibling_done_unseen() {
+        let mut app = app_with_linked_worktree();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.outer_terminal_focus = Some(false);
+
+        let first = app.state.workspaces[0].tabs[0].root_pane;
+        let second = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let other_tab = app.state.workspaces[0].test_add_tab(Some("other"));
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].switch_tab(other_tab);
+        for pane_id in [first, second] {
+            let terminal_id = app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            app.state.terminals.get_mut(&terminal_id).unwrap().state =
+                crate::detect::AgentState::Idle;
+            app.state.workspaces[0]
+                .pane_state_mut(pane_id)
+                .unwrap()
+                .seen = false;
+        }
+
+        let public_pane_id = app.public_pane_id(0, first).unwrap();
+        let response = app.handle_pane_focus(
+            "req".into(),
+            PaneTarget {
+                pane_id: public_pane_id,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Idle);
+        assert_eq!(app.state.workspaces[0].active_tab, 0);
+        assert!(app.state.workspaces[0].pane_state(first).unwrap().seen);
+        assert!(!app.state.workspaces[0].pane_state(second).unwrap().seen);
     }
 
     #[test]
