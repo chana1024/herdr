@@ -418,7 +418,15 @@ impl RemoteExecutable {
     fn saved_bridge_command(&self, session_name: &str) -> String {
         let args = Self::session_args(session_name, &["remote-client-bridge"]);
         match self {
-            Self::PosixShellPath(_) => format!("exec {} </dev/null", self.command(&args)),
+            // Stdin is closed rather than redirected from /dev/null: this
+            // invocation only triggers remote daemon startup and the bridge
+            // half-closes its upload side without reading input. A host whose
+            // /dev/null is a regular file with content (for example, from a
+            // broken MOTD script writing into it) would otherwise forward that
+            // file into the client socket as a bogus handshake, and the server
+            // aborts the connection. The bridge treats an unreadable stdin as
+            // immediate EOF. See issue #4162.
+            Self::PosixShellPath(_) => format!("exec {} 0<&-", self.command(&args)),
             Self::WindowsPath(path) => {
                 windows_powershell_streaming_application_command(path, &args)
             }
@@ -1206,6 +1214,43 @@ fn decode_windows_remote_path(encoded: &str) -> io::Result<String> {
     Ok(path)
 }
 
+impl Drop for RemoteSsh {
+    fn drop(&mut self) {
+        let Some(_options) = self
+            .managed_config
+            .as_ref()
+            .map(|config| &config.options)
+            .filter(|options| options.control_path.is_some())
+        else {
+            return;
+        };
+
+        let _ = self
+            .base_command()
+            .arg("-O")
+            .arg("exit")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg(&self.target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Options that define the noninteractive policy: never prompt for credentials
+/// and never accept an unknown host key. These must stay on the command line so
+/// a terminal cannot appear mid-setup.
+///
+/// Connection-tuning options (`ConnectTimeout`, `ConnectionAttempts`,
+/// `ServerAlive*`) are deliberately not forced here. Command-line `-o` always
+/// overrides `~/.ssh/config`, so hardcoding them would override per-host user
+/// tuning (`IPQoS`, keepalives, timeouts), which breaks DSCP-hostile routes
+/// where a tight handshake timer cannot complete. Users keep full control
+/// through their ssh config; unbounded commands are still bounded locally by
+/// `NONINTERACTIVE_SSH_COMMAND_TIMEOUT` and the handshake read timeout.
+/// See issue #4162.
 fn apply_noninteractive_ssh_options(command: &mut Command) {
     command
         .arg("-o")
@@ -1213,15 +1258,7 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
         .arg("-o")
         .arg("NumberOfPasswordPrompts=0")
         .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ConnectionAttempts=1")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=4");
+        .arg("StrictHostKeyChecking=yes");
 }
 
 fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
@@ -3188,10 +3225,16 @@ fn bridge_connection(
 
     let stopping = bridge_stop.load(Ordering::Acquire);
     let client_closed = client_closed.load(Ordering::Acquire);
-    if child_exited && !status.success() && !stopping && !client_closed {
+    // A self-exited non-zero ssh child or an upload/download failure is the
+    // authoritative cause of the disconnect even when the local client also
+    // closed: the client hangs up *because* the transport died, so reporting
+    // must not depend on that race. A benign client-initiated close still
+    // leaves ssh exiting 0 (the remote bridge exits 0 on stdin EOF) and the
+    // upload worker returns Ok, so it stays silent. See issue #4162.
+    if child_exited && !status.success() && !stopping {
         return Err(ssh_bridge_exit_error(status, &stderr));
     }
-    if !stopping && !client_closed {
+    if !stopping {
         upload_result.map_err(|err| {
             io::Error::new(err.kind(), format!("remote bridge upload failed: {err}"))
         })?;
@@ -4174,14 +4217,36 @@ mod tests {
             "BatchMode=yes",
             "NumberOfPasswordPrompts=0",
             "StrictHostKeyChecking=yes",
-            "ConnectTimeout=10",
-            "ConnectionAttempts=1",
-            "ServerAliveInterval=15",
-            "ServerAliveCountMax=4",
         ] {
             assert!(args.iter().any(|arg| arg == required), "missing {required}");
         }
         assert_eq!(args.iter().any(|arg| arg == "-F"), ssh.options().is_some());
+    }
+
+    #[test]
+    fn noninteractive_ssh_command_leaves_connection_tuning_to_ssh_config() {
+        // Command-line `-o` overrides `~/.ssh/config`, so forcing these would
+        // break per-host tuning (for example `IPQoS none` on DSCP-hostile
+        // routes) with no user workaround. See issue #4162.
+        let ssh = RemoteSsh::new_noninteractive("example".into());
+        let args = ssh
+            .command()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for forbidden_prefix in [
+            "ConnectTimeout=",
+            "ConnectionAttempts=",
+            "ServerAliveInterval=",
+            "ServerAliveCountMax=",
+        ] {
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.starts_with(forbidden_prefix) || arg == forbidden_prefix),
+                "noninteractive ssh must not force {forbidden_prefix}"
+            );
+        }
     }
 
     #[test]
@@ -5013,7 +5078,7 @@ function Get-Process {
         );
         assert_eq!(
             remote_herdr.executable.saved_bridge_command("agents"),
-            "exec \"$HOME/.local/bin/herdr\" --session agents remote-client-bridge </dev/null"
+            "exec \"$HOME/.local/bin/herdr\" --session agents remote-client-bridge 0<&-"
         );
     }
 
