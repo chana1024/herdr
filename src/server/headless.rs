@@ -828,7 +828,12 @@ impl HeadlessServer {
         apply_keybindings(&mut self.app, &server_keybindings);
         self.sync_visible_server_config_diagnostic(false);
         if outer_terminal_focus == Some(true) {
-            self.app.state.mark_active_tab_seen();
+            // Attaching or focusing a client must only acknowledge the pane
+            // the user actually has focused. Marking the whole active tab
+            // seen here cleared the done state of every agent sharing the
+            // tab the moment a client attached, before the user looked at
+            // those panes. Siblings keep their done status until visited.
+            self.app.state.mark_focused_pane_seen();
         }
         self.app.set_host_terminal_appearance_state(
             host_terminal_appearance,

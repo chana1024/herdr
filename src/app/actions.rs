@@ -486,6 +486,24 @@ impl AppState {
         changed
     }
 
+    /// Marks only the focused pane of the active tab as seen. Client attach
+    /// and outer-terminal focus sync use this: attaching a client that shares
+    /// a tab with agents must not clear the done state of panes the user has
+    /// not focused. Siblings keep their done status until visited.
+    pub(crate) fn mark_focused_pane_seen(&mut self) -> bool {
+        let Some(ws_idx) = self.active else {
+            return false;
+        };
+        let Some(pane_id) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+        else {
+            return false;
+        };
+        self.mark_pane_seen(ws_idx, pane_id)
+    }
+
     /// Marks one pane as seen without touching sibling panes in its tab.
     pub(crate) fn mark_pane_seen(&mut self, ws_idx: usize, pane_id: PaneId) -> bool {
         let Some(pane) = self
