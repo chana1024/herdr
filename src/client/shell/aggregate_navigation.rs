@@ -1,7 +1,7 @@
 //! Endpoint-qualified rows shared by aggregate navigation surfaces.
 
 use super::*;
-use crate::protocol::ClientShellAgent;
+use crate::protocol::{ClientShellAgent, ClientShellPane};
 
 #[derive(Clone, Copy)]
 pub(super) struct CachedEndpointSnapshot<'a> {
@@ -328,6 +328,8 @@ pub(super) fn navigator_rows(
                     .or_insert_with(Vec::new)
                     .push(pane);
             }
+            let status_mode = navigator.view_mode == ClientNavigatorViewMode::Status;
+            let mut status_rows = Vec::new();
             for workspace in &snapshot.workspaces {
                 let workspace_matches = endpoint_query_matches
                     || text(&workspace.label)
@@ -344,81 +346,53 @@ pub(super) fn navigator_rows(
                         .get(tab.tab_id.as_str())
                         .map(Vec::as_slice)
                         .unwrap_or_default();
+                    let pane_depth = match navigator.view_mode {
+                        ClientNavigatorViewMode::Grouped if multiple_tabs => 2 + depth_offset,
+                        ClientNavigatorViewMode::Status => depth_offset,
+                        _ => 1 + depth_offset,
+                    };
+                    let mut tab_children = Vec::new();
                     for (index, pane) in tab_panes.iter().enumerate() {
                         let agent = agents.get(pane.pane_id.as_str()).copied();
-                        let status = agent
-                            .map_or(crate::api::schema::AgentStatus::Unknown, |agent| {
-                                agent.agent_status
-                            });
-                        let agent_kind = agent.and_then(|agent| {
-                            agent.agent.as_deref().or(agent.display_agent.as_deref())
-                        });
-                        let name = pane
-                            .label
-                            .as_deref()
-                            .or_else(|| agent.and_then(|agent| agent.name.as_deref()));
-                        let title = agent.and_then(|agent| {
-                            agent
-                                .title
-                                .as_deref()
-                                .or(agent.terminal_title_stripped.as_deref())
-                        });
-                        let tab_name = (tab.custom_label || tab.label.parse::<usize>().is_err())
-                            .then_some(tab.label.as_str());
-                        let label = if tab_panes.len() == 1 {
-                            match name.or(tab_name).or(title) {
-                                Some(label) => label.to_owned(),
-                                None if multiple_tabs => {
-                                    format!("{} · {}", agent_kind.unwrap_or("terminal"), tab.label)
-                                }
-                                None => workspace.label.clone(),
-                            }
-                        } else {
-                            let pane_name = name.or(title).or(agent_kind).unwrap_or("terminal");
-                            match tab_name {
-                                Some(tab_name) if tab_name != pane_name => {
-                                    format!("{tab_name} · {pane_name} · {}", index + 1)
-                                }
-                                _ => format!("{pane_name} · {}", index + 1),
-                            }
-                        };
-                        let meta = pane
-                            .foreground_cwd
-                            .as_deref()
-                            .or(pane.cwd.as_deref())
-                            .unwrap_or_default();
-                        if filter(status)
-                            && (tab_matches
-                                || text(&label)
-                                || text(meta)
-                                || pane.cwd.as_deref().is_some_and(text)
-                                || agent_kind.is_some_and(text)
-                                || title.is_some_and(text)
-                                || agent
-                                    .and_then(|agent| agent.display_agent.as_deref())
-                                    .is_some_and(text)
-                                || text(&pane.pane_id))
-                        {
-                            children.push(ClientNavigatorRow {
-                                depth: 1 + depth_offset,
-                                label,
-                                meta: meta.to_owned(),
-                                detail: format!(
-                                    "{} / {} / {}",
-                                    workspace.label, tab.label, pane.pane_id
-                                ),
-                                agent: agent_kind.map(str::to_owned),
-                                status: Some(status),
-                                stale,
-                                current: endpoint.endpoint_id == *active_endpoint_id
-                                    && snapshot.focused_pane_id.as_deref() == Some(&pane.pane_id),
-                                target: ClientNavigatorTarget::Pane {
-                                    endpoint_id: endpoint.endpoint_id.clone(),
-                                    pane_id: pane.pane_id.clone(),
-                                },
-                            });
+                        if let Some(row) = navigator_pane_row(
+                            &endpoint.endpoint_id,
+                            active_endpoint_id,
+                            snapshot.focused_pane_id.as_deref(),
+                            workspace,
+                            tab,
+                            pane,
+                            agent,
+                            tab_panes.len(),
+                            index,
+                            multiple_tabs,
+                            tab_matches,
+                            stale,
+                            pane_depth,
+                            &filter,
+                            &text,
+                        ) {
+                            tab_children.push(row);
                         }
                     }
+                    match navigator.view_mode {
+                        ClientNavigatorViewMode::Grouped => {
+                            if multiple_tabs && (!filtering || !tab_children.is_empty()) {
+                                children.push(navigator_tab_row(
+                                    &endpoint.endpoint_id,
+                                    workspace,
+                                    tab,
+                                    stale,
+                                    1 + depth_offset,
+                                ));
+                            }
+                            children.extend(tab_children);
+                        }
+                        ClientNavigatorViewMode::Status => status_rows.extend(tab_children),
+                        ClientNavigatorViewMode::Flat => children.extend(tab_children),
+                    }
+                }
+                if status_mode {
+                    continue;
                 }
                 if !filtering
                     || !children.is_empty()
@@ -441,6 +415,18 @@ pub(super) fn navigator_rows(
                     endpoint_rows.extend(children);
                 }
             }
+            if status_mode {
+                // Stable sort keeps the structural snapshot order inside each
+                // status band, so blocked panes surface first without new
+                // recency plumbing.
+                status_rows.sort_by_key(|row| {
+                    std::cmp::Reverse(status_priority(
+                        row.status
+                            .unwrap_or(crate::api::schema::AgentStatus::Unknown),
+                    ))
+                });
+                endpoint_rows = status_rows;
+            }
         }
         if !filtering || endpoint_query_matches || !endpoint_rows.is_empty() {
             if federated {
@@ -462,6 +448,120 @@ pub(super) fn navigator_rows(
         }
     }
     rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn navigator_pane_row(
+    endpoint_id: &ClientEndpointId,
+    active_endpoint_id: &ClientEndpointId,
+    focused_pane_id: Option<&str>,
+    workspace: &ClientShellWorkspace,
+    tab: &ClientShellTab,
+    pane: &ClientShellPane,
+    agent: Option<&ClientShellAgent>,
+    tab_pane_count: usize,
+    pane_index: usize,
+    multiple_tabs: bool,
+    tab_matches: bool,
+    stale: bool,
+    depth: u8,
+    filter: &impl Fn(crate::api::schema::AgentStatus) -> bool,
+    text: &impl Fn(&str) -> bool,
+) -> Option<ClientNavigatorRow> {
+    let status = agent.map_or(crate::api::schema::AgentStatus::Unknown, |agent| {
+        agent.agent_status
+    });
+    let agent_kind =
+        agent.and_then(|agent| agent.agent.as_deref().or(agent.display_agent.as_deref()));
+    let name = pane
+        .label
+        .as_deref()
+        .or_else(|| agent.and_then(|agent| agent.name.as_deref()));
+    let title = agent.and_then(|agent| {
+        agent
+            .title
+            .as_deref()
+            .or(agent.terminal_title_stripped.as_deref())
+    });
+    let tab_name =
+        (tab.custom_label || tab.label.parse::<usize>().is_err()).then_some(tab.label.as_str());
+    let label = if tab_pane_count == 1 {
+        match name.or(tab_name).or(title) {
+            Some(label) => label.to_owned(),
+            None if multiple_tabs => {
+                format!("{} · {}", agent_kind.unwrap_or("terminal"), tab.label)
+            }
+            None => workspace.label.clone(),
+        }
+    } else {
+        let pane_name = name.or(title).or(agent_kind).unwrap_or("terminal");
+        match tab_name {
+            Some(tab_name) if tab_name != pane_name => {
+                format!("{tab_name} · {pane_name} · {}", pane_index + 1)
+            }
+            _ => format!("{pane_name} · {}", pane_index + 1),
+        }
+    };
+    let meta = pane
+        .foreground_cwd
+        .as_deref()
+        .or(pane.cwd.as_deref())
+        .unwrap_or_default();
+    if !filter(status)
+        || !(tab_matches
+            || text(&label)
+            || text(meta)
+            || pane.cwd.as_deref().is_some_and(text)
+            || agent_kind.is_some_and(text)
+            || title.is_some_and(text)
+            || agent
+                .and_then(|agent| agent.display_agent.as_deref())
+                .is_some_and(text)
+            || text(&pane.pane_id))
+    {
+        return None;
+    }
+    Some(ClientNavigatorRow {
+        depth,
+        label,
+        meta: meta.to_owned(),
+        detail: format!("{} / {} / {}", workspace.label, tab.label, pane.pane_id),
+        agent: agent_kind.map(str::to_owned),
+        status: Some(status),
+        stale,
+        current: endpoint_id == active_endpoint_id && focused_pane_id == Some(&pane.pane_id),
+        target: ClientNavigatorTarget::Pane {
+            endpoint_id: endpoint_id.clone(),
+            pane_id: pane.pane_id.clone(),
+        },
+    })
+}
+
+fn navigator_tab_row(
+    endpoint_id: &ClientEndpointId,
+    workspace: &ClientShellWorkspace,
+    tab: &ClientShellTab,
+    stale: bool,
+    depth: u8,
+) -> ClientNavigatorRow {
+    let tab_name =
+        (tab.custom_label || tab.label.parse::<usize>().is_err()).then_some(tab.label.as_str());
+    ClientNavigatorRow {
+        depth,
+        label: tab_name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("tab {}", tab.label)),
+        meta: String::new(),
+        detail: format!("{} / {}", workspace.label, tab.label),
+        agent: None,
+        status: None,
+        stale,
+        current: false,
+        target: ClientNavigatorTarget::Tab {
+            endpoint_id: endpoint_id.clone(),
+            tab_id: tab.tab_id.clone(),
+        },
+    }
 }
 
 pub(super) fn navigator_selected_index(

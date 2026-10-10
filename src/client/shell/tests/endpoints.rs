@@ -2319,6 +2319,9 @@ fn local_direct_graphics_accept_server_ids_across_endpoint_switches_and_restarts
 fn navigator_uses_machine_parents_only_for_federated_clients() {
     let (mut state, _) = state_with_remote();
     state.open_navigator_overlay();
+    if let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() {
+        navigator.view_mode = ClientNavigatorViewMode::Flat;
+    }
     let ClientShellOverlay::Navigator(navigator) = state.overlay.as_ref().expect("navigator")
     else {
         panic!("expected navigator");
@@ -2343,6 +2346,7 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
     assert!(rows.iter().all(|row| match row.target {
         ClientNavigatorTarget::Machine { .. } => row.depth == 0 && row.status.is_none(),
         ClientNavigatorTarget::Workspace { .. } => row.depth == 1 && row.status.is_none(),
+        ClientNavigatorTarget::Tab { .. } => false,
         ClientNavigatorTarget::Pane { .. } => row.depth == 2 && row.status.is_some(),
     }));
     assert_eq!(rows.iter().filter(|row| row.current).count(), 1);
@@ -2352,6 +2356,7 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
         let expected = match target {
             ClientNavigatorTarget::Machine { .. } => " ",
             ClientNavigatorTarget::Workspace { .. } => "   ",
+            ClientNavigatorTarget::Tab { .. } => unreachable!("flat mode has no tab headings"),
             ClientNavigatorTarget::Pane { .. } => "   └─ ",
         };
         let prefix = frame.cells[rect.y as usize * frame.width as usize + rect.x as usize..]
@@ -2379,6 +2384,9 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
         .join("\n")
         .contains(" machines"));
     local.open_navigator_overlay();
+    if let Some(ClientShellOverlay::Navigator(navigator)) = local.overlay.as_mut() {
+        navigator.view_mode = ClientNavigatorViewMode::Flat;
+    }
     let ClientShellOverlay::Navigator(navigator) = local.overlay.as_ref().expect("navigator")
     else {
         panic!("expected navigator");
@@ -2391,7 +2399,7 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
     assert!(rows.iter().all(|row| match row.target {
         ClientNavigatorTarget::Workspace { .. } => row.depth == 0,
         ClientNavigatorTarget::Pane { .. } => row.depth == 1,
-        ClientNavigatorTarget::Machine { .. } => false,
+        ClientNavigatorTarget::Tab { .. } | ClientNavigatorTarget::Machine { .. } => false,
     }));
 }
 
@@ -2422,7 +2430,7 @@ fn navigator_keeps_saved_machine_visible_before_metadata_arrives() {
             && row.stale
     }));
     assert!(!rows.iter().any(|row| match &row.target {
-        ClientNavigatorTarget::Machine { .. } => false,
+        ClientNavigatorTarget::Machine { .. } | ClientNavigatorTarget::Tab { .. } => false,
         ClientNavigatorTarget::Workspace {
             endpoint_id: target,
             ..

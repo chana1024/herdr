@@ -1013,6 +1013,9 @@ fn navigator_renders_every_terminal_in_workspace_sections() {
     state.set_snapshot(Box::new(snapshot));
     state.set_pane_surface(surface());
     state.open_navigator_overlay();
+    if let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() {
+        navigator.view_mode = ClientNavigatorViewMode::Flat;
+    }
     let visible_rows = |state: &mut ClientShellState, height| {
         let frame = state.compose(106, height).expect("navigator frame");
         state
@@ -1668,6 +1671,273 @@ fn navigator_grouping_keeps_snapshot_order_with_interleaved_tabs_and_panes() {
         })
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+fn navigator_grouped_agent_snapshot() -> ClientShellSnapshot {
+    // One workspace, two tabs, two panes per tab: the minimum shape where
+    // grouped mode inserts tab headings.
+    let mut snapshot = navigator_scale_snapshot(1, 2, 2);
+    snapshot.focused_pane_id = Some("pane_0_0_0".into());
+    snapshot
+}
+
+fn navigator_rows_from(state: &ClientShellState) -> Vec<(u8, String, ClientNavigatorTarget)> {
+    let ClientShellOverlay::Navigator(navigator) = state.overlay.as_ref().expect("navigator")
+    else {
+        panic!("expected navigator");
+    };
+    render::client_navigator_rows(&state.endpoints, &state.active_endpoint_id, navigator)
+        .into_iter()
+        .map(|row| (row.depth, row.label, row.target))
+        .collect()
+}
+
+#[test]
+fn navigator_grouped_mode_inserts_selectable_tab_headings() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(navigator_grouped_agent_snapshot()));
+    state.set_pane_surface(surface());
+    state.open_navigator_overlay();
+
+    let rows = navigator_rows_from(&state);
+    let workspace_depth = rows
+        .iter()
+        .find(|(_, _, target)| matches!(target, ClientNavigatorTarget::Workspace { .. }))
+        .map(|(depth, _, _)| *depth)
+        .expect("workspace heading");
+    let tab_headings = rows
+        .iter()
+        .filter(|(_, _, target)| matches!(target, ClientNavigatorTarget::Tab { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(tab_headings.len(), 2);
+    for (depth, label, target) in &tab_headings {
+        assert_eq!(*depth, workspace_depth + 1);
+        assert!(label.starts_with("tab "), "{label:?} should be a heading");
+        assert!(
+            matches!(target, ClientNavigatorTarget::Tab { tab_id, .. } if tab_id.starts_with("tab_0_"))
+        );
+    }
+    let pane_depths = rows
+        .iter()
+        .filter(|(_, _, target)| matches!(target, ClientNavigatorTarget::Pane { .. }))
+        .map(|(depth, _, _)| *depth)
+        .collect::<Vec<_>>();
+    assert_eq!(pane_depths, vec![workspace_depth + 2; 4]);
+    // Headings come before their panes: the first pane follows the first heading.
+    let first_tab_index = rows
+        .iter()
+        .position(|(_, _, target)| matches!(target, ClientNavigatorTarget::Tab { .. }))
+        .expect("tab heading");
+    assert!(matches!(
+        rows[first_tab_index + 1].2,
+        ClientNavigatorTarget::Pane { .. }
+    ));
+}
+
+#[test]
+fn navigator_view_mode_key_cycles_and_keeps_selection() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(navigator_grouped_agent_snapshot()));
+    state.set_pane_surface(surface());
+    state.open_navigator_overlay();
+
+    let selected = |state: &ClientShellState| {
+        let ClientShellOverlay::Navigator(navigator) = state.overlay.as_ref().expect("navigator")
+        else {
+            panic!("expected navigator");
+        };
+        (navigator.view_mode, navigator.selected.clone())
+    };
+    let initial = selected(&state);
+    assert_eq!(initial.0, ClientNavigatorViewMode::Grouped);
+    assert!(matches!(
+        initial.1,
+        Some(ClientNavigatorTarget::Pane { .. })
+    ));
+
+    assert!(state.handle_input_bytes(b"t").repaint);
+    let (mode, selection) = selected(&state);
+    assert_eq!(mode, ClientNavigatorViewMode::Status);
+    assert_eq!(selection, initial.1);
+    assert!(state.handle_input_bytes(b"t").repaint);
+    assert_eq!(selected(&state).0, ClientNavigatorViewMode::Flat);
+    assert!(state.handle_input_bytes(b"t").repaint);
+    let (mode, selection) = selected(&state);
+    assert_eq!(mode, ClientNavigatorViewMode::Grouped);
+    assert_eq!(selection, initial.1);
+}
+
+#[test]
+fn navigator_status_mode_sorts_blocked_first_and_keeps_snapshot_order() {
+    // The client projects a Done agent it never saw working back to Idle, so the
+    // fixture walks the real transition: everything starts working, then the
+    // second snapshot delivers the statuses under test.
+    let transitions = [
+        ("pane_0_0_0", AgentStatus::Working),
+        ("pane_0_0_1", AgentStatus::Blocked),
+        ("pane_0_1_0", AgentStatus::Idle),
+        ("pane_0_1_1", AgentStatus::Done),
+    ];
+    let build_snapshot = |seq: u64, transitions: &[(&str, AgentStatus)]| {
+        let mut snapshot = navigator_grouped_agent_snapshot();
+        for (pane_id, agent_status) in transitions {
+            snapshot.agents.push(ClientShellAgent {
+                pane_id: (*pane_id).into(),
+                workspace_id: "workspace_0".into(),
+                tab_id: String::new(),
+                name: None,
+                display_agent: Some("claude".into()),
+                agent: Some("claude".into()),
+                title: None,
+                terminal_title_stripped: None,
+                terminal_title: None,
+                agent_status: *agent_status,
+                state_change_seq: seq,
+                state_labels: Vec::new(),
+                tokens: Vec::new(),
+                focused: false,
+            });
+        }
+        snapshot
+    };
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let working: Vec<_> = transitions
+        .iter()
+        .map(|(pane, _)| (*pane, AgentStatus::Working))
+        .collect();
+    state.set_snapshot(Box::new(build_snapshot(1, &working)));
+    state.set_snapshot(Box::new(build_snapshot(2, &transitions)));
+    state.set_pane_surface(surface());
+    state.open_navigator_overlay();
+    if let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() {
+        navigator.view_mode = ClientNavigatorViewMode::Status;
+    }
+
+    let rows = navigator_rows_from(&state);
+    assert!(rows
+        .iter()
+        .all(|(_, _, target)| matches!(target, ClientNavigatorTarget::Pane { .. })));
+    let pane_order = rows
+        .iter()
+        .map(|(_, _, target)| match &target {
+            ClientNavigatorTarget::Pane { pane_id, .. } => pane_id.as_str(),
+            _ => unreachable!("panes only"),
+        })
+        .collect::<Vec<_>>();
+    // Presented statuses: pane_0_0_1 blocked, pane_0_1_0 and pane_0_1_1 done
+    // (idle after observed work projects to done), pane_0_0_0 working. Blocked
+    // sorts first, then done, then working; equal statuses keep the structural
+    // snapshot order.
+    assert_eq!(
+        pane_order,
+        ["pane_0_0_1", "pane_0_1_0", "pane_0_1_1", "pane_0_0_0"]
+    );
+}
+
+#[test]
+fn navigator_tab_heading_enter_focuses_the_tab() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(navigator_grouped_agent_snapshot()));
+    state.set_pane_surface(surface());
+    state.open_navigator_overlay();
+    let selected = navigator_rows_from(&state)
+        .into_iter()
+        .find_map(|(_, _, target)| match target {
+            ClientNavigatorTarget::Tab {
+                endpoint_id,
+                tab_id,
+            } => Some((endpoint_id, tab_id)),
+            _ => None,
+        })
+        .expect("tab heading");
+    if let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() {
+        navigator.selected = Some(ClientNavigatorTarget::Tab {
+            endpoint_id: selected.0,
+            tab_id: selected.1.clone(),
+        });
+    }
+
+    let mut outcome = ClientShellInput::default();
+    state.accept_navigator_selection(&mut outcome);
+
+    assert!(state.overlay.is_none());
+    assert!(state
+        .pending_requests
+        .values()
+        .any(|pending| pending.method_name == "tab.focus"));
+}
+
+#[test]
+fn navigator_filtering_hides_empty_tab_headings() {
+    let mut snapshot = navigator_grouped_agent_snapshot();
+    snapshot.agents.push(ClientShellAgent {
+        pane_id: "pane_0_1_0".into(),
+        workspace_id: "workspace_0".into(),
+        tab_id: "tab_0_1".into(),
+        name: None,
+        display_agent: Some("claude".into()),
+        agent: Some("claude".into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: AgentStatus::Blocked,
+        state_change_seq: 0,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: false,
+    });
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    state.open_navigator_overlay();
+    if let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() {
+        navigator.filter = Some(ClientNavigatorFilter::Blocked);
+    }
+
+    let rows = navigator_rows_from(&state);
+    assert_eq!(rows.len(), 3);
+    assert!(matches!(rows[0].2, ClientNavigatorTarget::Workspace { .. }));
+    let ClientNavigatorTarget::Tab { tab_id, .. } = &rows[1].2 else {
+        panic!(
+            "expected the blocked pane's tab heading, got {:?}",
+            rows[1].2
+        );
+    };
+    assert_eq!(tab_id, "tab_0_1");
+    assert!(matches!(
+        &rows[2].2,
+        ClientNavigatorTarget::Pane { pane_id, .. } if pane_id == "pane_0_1_0"
+    ));
+}
+
+#[test]
+fn navigator_arrows_are_inert_in_status_mode() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(navigator_grouped_agent_snapshot()));
+    state.set_pane_surface(surface());
+    state.open_navigator_overlay();
+    if let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() {
+        navigator.view_mode = ClientNavigatorViewMode::Status;
+    }
+    state.handle_input_bytes(b"j");
+    let before = {
+        let ClientShellOverlay::Navigator(navigator) = state.overlay.as_ref().expect("navigator")
+        else {
+            panic!("expected navigator");
+        };
+        navigator.selected.clone()
+    };
+
+    assert!(state.handle_input_bytes(b"\x1b[D").repaint);
+    assert!(state.handle_input_bytes(b"\x1b[C").repaint);
+    let after = {
+        let ClientShellOverlay::Navigator(navigator) = state.overlay.as_ref().expect("navigator")
+        else {
+            panic!("expected navigator");
+        };
+        navigator.selected.clone()
+    };
+    assert_eq!(before, after);
 }
 
 #[test]

@@ -197,6 +197,7 @@ impl ClientShellState {
             selected: None,
             scroll: 0,
             filter: None,
+            view_mode: ClientNavigatorViewMode::default(),
         };
         let rows =
             render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, &navigator);
@@ -239,10 +240,33 @@ impl ClientShellState {
         navigator.selected = rows.get(selected).map(|row| row.target.clone());
     }
 
+    fn cycle_navigator_view_mode(&mut self) {
+        let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
+            return;
+        };
+        let previous = navigator.selected.clone();
+        navigator.view_mode = navigator.view_mode.next();
+        let rows =
+            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
+        navigator.selected = match previous {
+            Some(target) if rows.iter().any(|row| row.target == target) => Some(target),
+            // The selected target may vanish under the new structure (e.g. a
+            // status filter); fall back to the focused pane like a fresh open.
+            _ => rows
+                .iter()
+                .find(|row| row.current)
+                .map(|row| row.target.clone()),
+        };
+        navigator.scroll = 0;
+    }
+
     fn move_navigator_workspace(&mut self, forward: bool) {
         let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
             return;
         };
+        if navigator.view_mode == ClientNavigatorViewMode::Status {
+            return;
+        }
         let rows =
             render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
         let Some(selected) =
@@ -255,8 +279,10 @@ impl ClientShellState {
             .rposition(|row| !matches!(row.target, ClientNavigatorTarget::Pane { .. }))
             .unwrap_or(selected);
         let mut destinations = rows.windows(2).enumerate().filter(|(index, pair)| {
-            matches!(pair[0].target, ClientNavigatorTarget::Workspace { .. })
-                && matches!(pair[1].target, ClientNavigatorTarget::Pane { .. })
+            matches!(
+                pair[0].target,
+                ClientNavigatorTarget::Workspace { .. } | ClientNavigatorTarget::Tab { .. }
+            ) && matches!(pair[1].target, ClientNavigatorTarget::Pane { .. })
                 && if forward {
                     *index > section
                 } else {
@@ -300,6 +326,12 @@ impl ClientShellState {
                 ClientEndpointFocusTarget::Workspace(workspace_id),
                 outcome,
             ),
+            ClientNavigatorTarget::Tab {
+                endpoint_id,
+                tab_id,
+            } => {
+                self.focus_or_activate(endpoint_id, ClientEndpointFocusTarget::Tab(tab_id), outcome)
+            }
             ClientNavigatorTarget::Pane {
                 endpoint_id,
                 pane_id,
@@ -774,6 +806,11 @@ impl ClientShellState {
                     navigator.filter = None;
                     navigator.selected = None;
                 }
+                outcome.repaint = true;
+                return;
+            }
+            if code == KeyCode::Char('t') && modifiers.is_empty() {
+                self.cycle_navigator_view_mode();
                 outcome.repaint = true;
                 return;
             }

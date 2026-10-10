@@ -274,6 +274,7 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
             selected: None,
             scroll: 0,
             filter: None,
+            view_mode: ClientNavigatorViewMode::Flat,
         }),
         ClientShellOverlay::WorktreeCreate(ClientWorktreeCreateOverlay {
             source_workspace_id: "ws_1".into(),

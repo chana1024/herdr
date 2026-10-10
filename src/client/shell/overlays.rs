@@ -854,6 +854,8 @@ fn render_navigator_overlay(
                 .fg(
                     if matches!(r.target, ClientNavigatorTarget::Machine { .. }) {
                         p.subtext0
+                    } else if matches!(r.target, ClientNavigatorTarget::Tab { .. }) {
+                        p.overlay1
                     } else {
                         p.text
                     },
@@ -879,7 +881,14 @@ fn render_navigator_overlay(
         let status_separator = if status.is_empty() { "" } else { " " };
         let label = format!("{indent}{current}{status}{status_separator}{}", r.label);
         let st = if r.status.is_none() {
-            st.add_modifier(Modifier::BOLD)
+            // Tab section headers borrow the switcher's section grammar
+            // (overlay1 + bold + underlined) so they read as groups, not rows.
+            let st = st.add_modifier(Modifier::BOLD);
+            if matches!(r.target, ClientNavigatorTarget::Tab { .. }) {
+                st.add_modifier(Modifier::UNDERLINED)
+            } else {
+                st
+            }
         } else {
             st
         };
@@ -1021,16 +1030,20 @@ fn render_navigator_overlay(
             Style::default().fg(p.overlay0).bg(p.panel_bg),
         );
     }
+    let view = n.view_mode.label();
+    let hints = if n.search_focused {
+        " search type · move ↑↓/ctrl+n/p · open enter · back esc".to_owned()
+    } else {
+        format!(
+            " ↑↓/j/k rows · ←→ workspace · / search · a/b/w/i/d filter · t view: {view} · enter open · esc close"
+        )
+    };
     put_text(
         b,
         i.x,
         i.bottom() - 1,
         i.width,
-        if n.search_focused {
-            " search type · move ↑↓/ctrl+n/p · open enter · back esc"
-        } else {
-            " ↑↓/j/k rows · ←→ workspace · / search · a/b/w/i/d filter · enter open · esc close"
-        },
+        &hints,
         Style::default().fg(p.overlay0).bg(p.panel_bg),
     );
     Some(OverlayRender {

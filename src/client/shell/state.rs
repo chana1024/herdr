@@ -332,6 +332,31 @@ pub(super) enum ClientNavigatorFilter {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ClientNavigatorViewMode {
+    #[default]
+    Grouped,
+    Status,
+    Flat,
+}
+
+impl ClientNavigatorViewMode {
+    pub(super) const ALL: &'static [Self] = &[Self::Grouped, Self::Status, Self::Flat];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "tabs",
+            Self::Status => "status",
+            Self::Flat => "flat",
+        }
+    }
+
+    pub(super) fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientNavigatorTarget {
     Machine {
@@ -340,6 +365,10 @@ pub(super) enum ClientNavigatorTarget {
     Workspace {
         endpoint_id: ClientEndpointId,
         workspace_id: String,
+    },
+    Tab {
+        endpoint_id: ClientEndpointId,
+        tab_id: String,
     },
     Pane {
         endpoint_id: ClientEndpointId,
@@ -367,6 +396,7 @@ pub(super) struct ClientNavigatorOverlay {
     pub(super) selected: Option<ClientNavigatorTarget>,
     pub(super) scroll: usize,
     pub(super) filter: Option<ClientNavigatorFilter>,
+    pub(super) view_mode: ClientNavigatorViewMode,
 }
 
 #[derive(Debug)]
