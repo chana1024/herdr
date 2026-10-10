@@ -22,7 +22,7 @@ pub(crate) fn toast_message_from_state_change(
     state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     pane_id: PaneId,
-    suppress_active_tab_notifications: bool,
+    suppress_focused_pane_notifications: bool,
     prev_state: AgentState,
     new_state: AgentState,
 ) -> Option<String> {
@@ -38,7 +38,7 @@ pub(crate) fn toast_message_from_state_change(
                     .get(&pane.attached_terminal_id)
                     .and_then(|terminal| terminal.effective_agent_label())?;
                 let kind = app::actions::notification_toast_for_state_change(
-                    suppress_active_tab_notifications,
+                    suppress_focused_pane_notifications,
                     prev_state,
                     new_state,
                 )?;

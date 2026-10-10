@@ -876,9 +876,9 @@ impl HeadlessServer {
         self.clients.get(&client_id)?.outer_terminal_focus
     }
 
-    fn active_tab_suppresses_notifications(&self, is_active_tab: bool) -> bool {
-        crate::app::actions::active_tab_suppresses_notifications(
-            is_active_tab,
+    fn focused_pane_suppresses_notifications(&self, is_focused_pane: bool) -> bool {
+        crate::app::actions::focused_pane_suppresses_notifications(
+            is_focused_pane,
             self.foreground_client_outer_focus(),
         )
     }
@@ -3145,9 +3145,9 @@ impl HeadlessServer {
                 continue;
             }
 
-            let is_active_tab = self.app.state.pane_is_in_active_tab(*ws_idx, *pane_id);
-            let suppress_active_tab_notifications =
-                self.active_tab_suppresses_notifications(is_active_tab);
+            let is_focused_pane = self.app.state.pane_is_focused(*ws_idx, *pane_id);
+            let suppress_focused_pane_notifications =
+                self.focused_pane_suppresses_notifications(is_focused_pane);
 
             let agent = terminal_after.effective_known_agent();
             let agent_label = terminal_after.effective_agent_label().map(str::to_string);
@@ -3175,7 +3175,7 @@ impl HeadlessServer {
                 && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
             {
                 if let Some(kind) = crate::app::actions::notification_toast_for_state_change(
-                    suppress_active_tab_notifications,
+                    suppress_focused_pane_notifications,
                     *prev_state,
                     new_state,
                 ) {
@@ -3216,7 +3216,7 @@ impl HeadlessServer {
             if self.app.state.toast_config.delay_seconds == 0 && self.app.state.sound.allows(agent)
             {
                 if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
-                    suppress_active_tab_notifications,
+                    suppress_focused_pane_notifications,
                     *prev_state,
                     new_state,
                 ) {

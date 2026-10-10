@@ -35,15 +35,15 @@ fn public_tab_id_for_index(ws: &crate::workspace::Workspace, tab_idx: usize) -> 
     ))
 }
 
-pub fn active_tab_suppresses_notifications(
-    is_active_tab: bool,
+pub fn focused_pane_suppresses_notifications(
+    is_focused_pane: bool,
     outer_terminal_focus: Option<bool>,
 ) -> bool {
-    is_active_tab && outer_terminal_focus != Some(false)
+    is_focused_pane && outer_terminal_focus != Some(false)
 }
 
 pub fn notification_sound_for_state_change(
-    suppress_active_tab_notifications: bool,
+    suppress_focused_pane_notifications: bool,
     prev_state: AgentState,
     new_state: AgentState,
 ) -> Option<crate::sound::Sound> {
@@ -55,7 +55,7 @@ pub fn notification_sound_for_state_change(
         AgentState::Blocked => Some(crate::sound::Sound::Request),
         AgentState::Idle
             if is_background_completion_transition(prev_state, new_state)
-                && !suppress_active_tab_notifications =>
+                && !suppress_focused_pane_notifications =>
         {
             Some(crate::sound::Sound::Done)
         }
@@ -64,22 +64,22 @@ pub fn notification_sound_for_state_change(
 }
 
 fn notification_sound_for_effective_state_change(
-    suppress_active_tab_notifications: bool,
+    suppress_focused_pane_notifications: bool,
     change: &EffectiveStateChange,
 ) -> Option<crate::sound::Sound> {
     notification_sound_for_state_change(
-        suppress_active_tab_notifications,
+        suppress_focused_pane_notifications,
         change.previous_state,
         change.state,
     )
 }
 
 pub fn notification_toast_for_state_change(
-    suppress_active_tab_notifications: bool,
+    suppress_focused_pane_notifications: bool,
     prev_state: AgentState,
     new_state: AgentState,
 ) -> Option<ToastKind> {
-    if suppress_active_tab_notifications || new_state == prev_state {
+    if suppress_focused_pane_notifications || new_state == prev_state {
         return None;
     }
 
@@ -93,29 +93,29 @@ pub fn notification_toast_for_state_change(
 }
 
 fn notification_toast_for_effective_state_change(
-    suppress_active_tab_notifications: bool,
+    suppress_focused_pane_notifications: bool,
     change: &EffectiveStateChange,
 ) -> Option<ToastKind> {
     notification_toast_for_state_change(
-        suppress_active_tab_notifications,
+        suppress_focused_pane_notifications,
         change.previous_state,
         change.state,
     )
 }
 
 pub fn notification_toast_for_pane_state_update(
-    suppress_active_tab_notifications: bool,
+    suppress_focused_pane_notifications: bool,
     update: &PaneStateUpdate,
 ) -> Option<ToastKind> {
     if update.suppress_completion
-        || suppress_active_tab_notifications
+        || suppress_focused_pane_notifications
         || update.state == update.previous_state
     {
         return None;
     }
 
     notification_toast_for_state_change(
-        suppress_active_tab_notifications,
+        suppress_focused_pane_notifications,
         update.previous_state,
         update.state,
     )
@@ -135,11 +135,11 @@ fn toast_event_text(kind: ToastKind) -> &'static str {
 
 fn sound_for_toast_kind(
     kind: ToastKind,
-    suppress_active_tab_notifications: bool,
+    suppress_focused_pane_notifications: bool,
 ) -> Option<crate::sound::Sound> {
     match kind {
         ToastKind::NeedsAttention => Some(crate::sound::Sound::Request),
-        ToastKind::Finished if !suppress_active_tab_notifications => {
+        ToastKind::Finished if !suppress_focused_pane_notifications => {
             Some(crate::sound::Sound::Done)
         }
         ToastKind::Finished | ToastKind::UpdateInstalled => None,
@@ -375,16 +375,22 @@ impl AppState {
         (changed_panes, changed_workspaces)
     }
 
-    pub(crate) fn pane_is_in_active_tab(&self, ws_idx: usize, pane_id: PaneId) -> bool {
-        let Some(active_ws_idx) = self.active else {
-            return false;
-        };
-        if active_ws_idx != ws_idx {
-            return false;
-        }
-        self.workspaces[ws_idx]
-            .find_tab_index_for_pane(pane_id)
-            .is_some_and(|tab_idx| tab_idx == self.workspaces[ws_idx].active_tab)
+    /// True when the pane is the focused pane of the active workspace. Used
+    /// for seen marking and notification suppression: sharing a tab with the
+    /// user's working pane does not mean the agent's output was looked at.
+    pub(crate) fn pane_is_focused(&self, ws_idx: usize, pane_id: PaneId) -> bool {
+        self.active == Some(ws_idx)
+            && self.workspaces.get(ws_idx).and_then(crate::workspace::Workspace::focused_pane_id)
+                == Some(pane_id)
+    }
+
+    /// True when the active workspace's focused pane is `pane_id`, without
+    /// needing the workspace index at the call site.
+    pub(crate) fn active_focused_pane_is(&self, pane_id: PaneId) -> bool {
+        self.active
+            .and_then(|ws_idx| self.workspaces.get(ws_idx))
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+            == Some(pane_id)
     }
 
     pub fn switch_workspace(&mut self, idx: usize) {
@@ -402,7 +408,10 @@ impl AppState {
                     public_tab_id_for_index(ws, active_tab).unwrap_or_else(|| workspace_id.clone());
                 crate::logging::tab_focused(&workspace_id, &tab_id);
             }
-            self.mark_active_tab_seen();
+            // Tab navigation acknowledges only the pane the user lands on:
+            // sibling agents in the entered tab keep their done status until
+            // the user actually focuses them.
+            self.mark_focused_pane_seen();
             self.record_pane_focus_after_navigation(previous_focus);
         }
     }
@@ -411,7 +420,9 @@ impl AppState {
         if !self.switch_workspace_tab_preserving_seen(ws_idx, tab_idx) {
             return false;
         }
-        self.mark_active_tab_seen();
+        // Same policy as switch_workspace: only the pane focus lands on is
+        // acknowledged; siblings keep their done status until focused.
+        self.mark_focused_pane_seen();
         true
     }
 
@@ -462,28 +473,6 @@ impl AppState {
             self.mark_session_dirty();
             self.record_pane_focus_after_navigation(previous_focus);
         }
-    }
-
-    pub(crate) fn mark_active_tab_seen(&mut self) -> bool {
-        let Some(ws_idx) = self.active else {
-            return false;
-        };
-        let Some(tab) = self
-            .workspaces
-            .get_mut(ws_idx)
-            .and_then(crate::workspace::Workspace::active_tab_mut)
-        else {
-            return false;
-        };
-
-        let mut changed = false;
-        for pane in tab.panes.values_mut() {
-            if !pane.seen {
-                pane.seen = true;
-                changed = true;
-            }
-        }
-        changed
     }
 
     /// Marks only the focused pane of the active tab as seen. Client attach
@@ -1881,9 +1870,9 @@ impl AppState {
         change: &EffectiveStateChange,
         suppress_completion: bool,
     ) -> Option<bool> {
-        let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
-        let suppress_active_tab_notifications =
-            active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
+        let is_focused_pane = self.pane_is_focused(ws_idx, pane_id);
+        let suppress_focused_pane_notifications =
+            focused_pane_suppresses_notifications(is_focused_pane, self.outer_terminal_focus);
         let pane = self.workspaces[ws_idx]
             .tabs
             .iter_mut()
@@ -1892,7 +1881,7 @@ impl AppState {
         if change.state != AgentState::Idle {
             pane.seen = true;
         } else if !suppress_completion && is_completion_transition(change) {
-            pane.seen = suppress_active_tab_notifications;
+            pane.seen = suppress_focused_pane_notifications;
         }
         let seen = pane.seen;
 
@@ -1915,16 +1904,16 @@ impl AppState {
     ) -> Option<AgentNotificationDelivery> {
         self.pending_agent_notifications.remove(&pane_id);
 
-        let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
-        let suppress_active_tab_notifications =
-            active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
+        let is_focused_pane = self.pane_is_focused(ws_idx, pane_id);
+        let suppress_focused_pane_notifications =
+            focused_pane_suppresses_notifications(is_focused_pane, self.outer_terminal_focus);
 
         let client_notification_kind = notification_toast_for_effective_state_change(
-            suppress_active_tab_notifications,
+            suppress_focused_pane_notifications,
             change,
         );
         let sound = notification_sound_for_effective_state_change(
-            suppress_active_tab_notifications,
+            suppress_focused_pane_notifications,
             change,
         );
         if client_notification_kind.is_none() && sound.is_none() {
@@ -2002,10 +1991,10 @@ impl AppState {
             return None;
         }
 
-        let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
-        let suppress_active_tab_notifications =
-            active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
-        let sound = sound_for_toast_kind(kind, suppress_active_tab_notifications)
+        let is_focused_pane = self.pane_is_focused(ws_idx, pane_id);
+        let suppress_focused_pane_notifications =
+            focused_pane_suppresses_notifications(is_focused_pane, self.outer_terminal_focus);
+        let sound = sound_for_toast_kind(kind, suppress_focused_pane_notifications)
             .filter(|_| self.sound.allows(known_agent));
         let build_toast = || {
             let workspace_label =
@@ -2027,8 +2016,8 @@ impl AppState {
                 }),
             }
         };
-        let toast = (!is_active_tab).then(build_toast);
-        let client_notification = (!suppress_active_tab_notifications).then(build_toast);
+        let toast = (!is_focused_pane).then(build_toast);
+        let client_notification = (!suppress_focused_pane_notifications).then(build_toast);
 
         if toast.is_none() && client_notification.is_none() && sound.is_none() {
             return None;
@@ -2811,14 +2800,23 @@ mod tests {
     }
 
     #[test]
-    fn switch_workspace_marks_panes_seen() {
+    fn switch_workspace_marks_focused_pane_seen() {
         let mut state = app_with_workspaces(&["a", "b"]);
-        // Mark a pane in workspace 1 as unseen
-        let id = *state.workspaces[1].panes.keys().next().unwrap();
-        state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
+        let first = state.workspaces[1].tabs[0].root_pane;
+        let second = state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
+        state.workspaces[1].pane_state_mut(first).unwrap().seen = false;
+        state.workspaces[1].pane_state_mut(second).unwrap().seen = false;
 
         state.switch_workspace(1);
-        assert!(state.workspaces[1].panes.get(&id).unwrap().seen);
+
+        // Only the pane focus lands on is acknowledged; the sibling keeps
+        // its done status until the user focuses it.
+        let focused = state.workspaces[1]
+            .focused_pane_id()
+            .expect("workspace has a focused pane");
+        let sibling = if focused == first { second } else { first };
+        assert!(state.workspaces[1].pane_state(focused).unwrap().seen);
+        assert!(!state.workspaces[1].pane_state(sibling).unwrap().seen);
     }
 
     #[test]
@@ -2848,7 +2846,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_workspace_tab_marks_all_panes_in_tab_seen() {
+    fn switch_workspace_tab_marks_only_focused_pane_seen() {
         let mut state = app_with_workspaces(&["work"]);
         let first = state.workspaces[0].tabs[0].root_pane;
         let second = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
@@ -2861,8 +2859,10 @@ mod tests {
         assert!(state.switch_workspace_tab(0, 0));
 
         let ws = &state.workspaces[0];
-        assert!(ws.pane_state(first).unwrap().seen);
-        assert!(ws.pane_state(second).unwrap().seen);
+        let focused = ws.focused_pane_id().expect("tab has a focused pane");
+        let sibling = if focused == first { second } else { first };
+        assert!(ws.pane_state(focused).unwrap().seen);
+        assert!(!ws.pane_state(sibling).unwrap().seen);
     }
 
     #[test]
@@ -4432,10 +4432,10 @@ mod tests {
 
     #[test]
     fn active_tab_suppression_preserves_unknown_focus_behavior() {
-        assert!(active_tab_suppresses_notifications(true, None));
-        assert!(active_tab_suppresses_notifications(true, Some(true)));
-        assert!(!active_tab_suppresses_notifications(true, Some(false)));
-        assert!(!active_tab_suppresses_notifications(false, None));
+        assert!(focused_pane_suppresses_notifications(true, None));
+        assert!(focused_pane_suppresses_notifications(true, Some(true)));
+        assert!(!focused_pane_suppresses_notifications(true, Some(false)));
+        assert!(!focused_pane_suppresses_notifications(false, None));
     }
 
     #[test]
@@ -4707,7 +4707,7 @@ mod tests {
             .publish_pane_process_exit_if_agent(pane_id, false)
             .expect("process exit update");
 
-        assert!(!state.pane_is_in_active_tab(update.ws_idx, pane_id));
+        assert!(!state.pane_is_focused(update.ws_idx, pane_id));
         assert_eq!(update.previous_state, AgentState::Working);
         assert_eq!(update.state, AgentState::Idle);
         assert_eq!(update.agent_label.as_deref(), Some("pi"));
