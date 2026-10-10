@@ -131,6 +131,13 @@ impl EndpointAgentPresentation {
 
         let mut changed = false;
         for pane in &surface.panes {
+            // Entering a tab acknowledges only the pane the user is actually
+            // focused on. Merely rendering sibling panes must not clear their
+            // Done status: they keep it until the user focuses them, matching
+            // the server-side seen semantics.
+            if !pane.focused {
+                continue;
+            }
             let Some(agent) = snapshot
                 .agents
                 .iter()
